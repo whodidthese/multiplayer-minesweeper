@@ -1,0 +1,50 @@
+/* public/css/style.css */
+body {
+    margin: 0;
+    padding: 0;
+    font-family: sans-serif;
+    background-color: #f0f0f0;
+    overscroll-behavior: contain; /* Prevent pull-to-refresh */
+    touch-action: none; /* Disable default touch actions like scrolling/zooming on body */
+    overflow: hidden; /* Hide scrollbars */
+    display: flex;
+    flex-direction: column;
+    height: 100vh; /* Full viewport height */
+}
+
+#game-container {
+    flex-grow: 1; /* Canvas container takes remaining space */
+    position: relative; /* Needed for absolute positioning of canvas if required */
+    overflow: hidden; /* Hide anything drawn outside bounds */
+    background-color: #ccc; /* Default background for canvas area */
+    touch-action: none; /* Disable default touch actions on the container */
+}
+
+#gameCanvas {
+    display: block; /* Remove extra space below canvas */
+    width: 100%;   /* Make canvas responsive */
+    height: 100%;  /* Make canvas responsive */
+    background-color: #e0e0e0; /* Light grey background */
+    image-rendering: pixelated; /* Better for pixel art styles */
+    image-rendering: crisp-edges;
+    touch-action: none; /* Ensure no default actions on canvas */
+}
+
+#ui-overlay {
+    position: absolute; /* Overlay on top of canvas */
+    top: 10px;
+    left: 10px;
+    padding: 5px 10px;
+    background-color: rgba(0, 0, 0, 0.5);
+    color: white;
+    border-radius: 5px;
+    pointer-events: none; /* Allow clicks/touches to pass through to canvas */
+    font-size: 14px;
+    z-index: 10;
+}
+
+#ui-overlay > div {
+    margin-bottom: 5px;
+}
+
+/* Add more styles as needed */

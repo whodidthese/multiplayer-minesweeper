@@ -1,0 +1,27 @@
+{
+	"name": "minesweeper-server",
+	"version": "1.0.0",
+	"description": "Multiplayer Minesweeper Server",
+	"main": "server.js",
+	"scripts": {
+		"start": "node server.js",
+		"dev": "node --watch server.js",
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"keywords": [
+		"minesweeper",
+		"multiplayer",
+		"websocket",
+		"game"
+	],
+	"author": "",
+	"license": "ISC",
+	"dependencies": {
+		"dotenv": "^16.4.5",
+		"sqlite3": "^5.1.7",
+		"ws": "^8.16.0"
+	},
+	"engines": {
+		"node": ">=18.0.0"
+	}
+}

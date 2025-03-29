@@ -1,0 +1,5 @@
+.cursor/
+.vscode/
+
+_refs/*
+!_refs/db_schema.sql.txt
