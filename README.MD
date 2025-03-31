@@ -38,7 +38,7 @@ Follow these instructions to get the server running locally for development or t
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/your-username/multiplayer-minesweeper.git](https://www.google.com/search?q=https://github.com/your-username/multiplayer-minesweeper.git) # Replace with your repo URL
+    git clone https://github.com/whodidthese/multiplayer-minesweeper
     cd multiplayer-minesweeper
     ```
 
