@@ -8,6 +8,8 @@ const CELL_SIZE = 25; // Visual size of cells in pixels (can be dynamic later)
 const PLAYER_CURSOR_COLOR = '#ff0000';
 const OTHER_PLAYER_CURSOR_COLOR = '#0000ff';
 const LONG_PRESS_DURATION = 500; // ms for long press detection
+const VIEWPORT_SYNC_INTERVAL = 150; // ms between position/region syncs while panning
+const REGION_MARGIN = 10; // Extra cells requested around the visible area
 
 // --- DOM Elements ---
 const canvas = document.getElementById('gameCanvas');
@@ -30,6 +32,9 @@ let isPanning = false;
 let panStartX = 0, panStartY = 0;
 let lastRenderTime = 0;
 let longPressTimer = null;
+let lastViewportSync = 0;
+let viewportSyncTimer = null;
+let stunnedUntil = 0; // performance.now() timestamp until which actions are blocked
 
 // --- WebSocket Logic ---
 function connectWebSocket() {
@@ -97,6 +102,24 @@ function handleWebSocketMessage(message) {
             // No need to updateUI immediately, render loop handles it
             break;
 
+        case 'regionState': {
+            const { xMin, xMax, yMin, yMax } = message.data;
+            // Drop cached cells inside the region: the server only sends non-hidden cells
+            for (const key in mapData) {
+                const [cx, cy] = key.split(',').map(Number);
+                if (inWrappedRange(cx, xMin, xMax) && inWrappedRange(cy, yMin, yMax)) {
+                    delete mapData[key];
+                }
+            }
+            message.data.cells.forEach(cell => {
+                mapData[`${cell.x},${cell.y}`] = { state: cell.state, value: cell.value };
+            });
+            message.data.players.forEach(p => {
+                players[p.id] = { ...p, isSelf: false };
+            });
+            break;
+        }
+
         case 'playerJoined':
             if (message.data.id !== playerId) {
                 players[message.data.id] = { ...message.data, isSelf: false };
@@ -109,9 +132,12 @@ function handleWebSocketMessage(message) {
 
         case 'playerPositionUpdate':
             message.data.players.forEach(p => {
-                if (players[p.id] && p.id !== playerId) {
+                if (p.id === playerId) return;
+                if (players[p.id]) {
                     players[p.id].x = p.x;
                     players[p.id].y = p.y;
+                } else {
+                    players[p.id] = { id: p.id, x: p.x, y: p.y, isSelf: false };
                 }
             });
             break;
@@ -123,9 +149,15 @@ function handleWebSocketMessage(message) {
 
         case 'playerPenalty':
             score = message.data.score;
-            // TODO: Implement visual stun effect?
+            stunnedUntil = performance.now() + message.data.stunDurationMs;
             logger.warn(`Mine hit! Stunned for ${message.data.stunDurationMs}ms`);
             updateUI();
+            break;
+
+        case 'actionRejected':
+            if (message.data.reason === 'stunned') {
+                stunnedUntil = performance.now() + message.data.remainingMs;
+            }
             break;
 
         case 'error': // Server-sent error
@@ -151,6 +183,7 @@ function resetLocalState() {
     score = 0;
     mapData = {};
     players = {};
+    stunnedUntil = 0;
     // Reset viewport? Maybe keep last position? For now, reset.
     viewport.x = 0;
     viewport.y = 0;
@@ -161,6 +194,51 @@ function resetLocalState() {
 function updateUI() {
     scoreElement.textContent = `Score: ${score}`;
     // Update status element handled by WebSocket events mostly
+}
+
+function inWrappedRange(v, min, max) {
+    return min <= max ? (v >= min && v <= max) : (v >= min || v <= max);
+}
+
+function isStunned() {
+    return performance.now() < stunnedUntil;
+}
+
+// --- Viewport Sync ---
+
+/**
+ * Tells the server where the viewport is centered and requests the cells around it.
+ * Throttled to VIEWPORT_SYNC_INTERVAL, with a trailing call so the final position is always sent.
+ */
+function syncViewport() {
+    const elapsed = performance.now() - lastViewportSync;
+    if (elapsed < VIEWPORT_SYNC_INTERVAL) {
+        if (!viewportSyncTimer) {
+            viewportSyncTimer = setTimeout(() => {
+                viewportSyncTimer = null;
+                syncViewport();
+            }, VIEWPORT_SYNC_INTERVAL - elapsed);
+        }
+        return;
+    }
+    lastViewportSync = performance.now();
+    if (!playerId) return;
+
+    const halfW = canvas.clientWidth / CELL_SIZE / 2;
+    const halfH = canvas.clientHeight / CELL_SIZE / 2;
+    const center = {
+        x: ((Math.floor(viewport.x + halfW) % MAP_WIDTH) + MAP_WIDTH) % MAP_WIDTH,
+        y: ((Math.floor(viewport.y + halfH) % MAP_HEIGHT) + MAP_HEIGHT) % MAP_HEIGHT,
+    };
+    if (players[playerId]) {
+        players[playerId].x = center.x;
+        players[playerId].y = center.y;
+    }
+    sendMessage({ type: 'updatePosition', data: center });
+    sendMessage({
+        type: 'requestRegion',
+        data: { ...center, radiusX: Math.ceil(halfW) + REGION_MARGIN, radiusY: Math.ceil(halfH) + REGION_MARGIN }
+    });
 }
 
 // --- Rendering Logic ---
@@ -265,9 +343,11 @@ function drawGame() {
          // Simplified check: is player visually near viewport center?
          // TODO: More robust check needed including visual wrapping display
 
-         // Calculate drawing position relative to viewport
-          const drawX = (player.x - viewport.x) * CELL_SIZE + CELL_SIZE / 2; // Center cursor
-          const drawY = (player.y - viewport.y) * CELL_SIZE + CELL_SIZE / 2;
+         // Calculate drawing position relative to viewport, wrapped onto the visible copy of the map
+          const relX = (((player.x - viewport.x) % MAP_WIDTH) + MAP_WIDTH) % MAP_WIDTH;
+          const relY = (((player.y - viewport.y) % MAP_HEIGHT) + MAP_HEIGHT) % MAP_HEIGHT;
+          const drawX = relX * CELL_SIZE + CELL_SIZE / 2; // Center cursor
+          const drawY = relY * CELL_SIZE + CELL_SIZE / 2;
 
           // Simple cursor representation
            ctx.fillStyle = player.isSelf ? PLAYER_CURSOR_COLOR : OTHER_PLAYER_CURSOR_COLOR;
@@ -279,6 +359,15 @@ function drawGame() {
            // ctx.fillText(player.id.substring(0, 4), drawX, drawY - CELL_SIZE * 0.3);
      }
 
+    // --- Stun Overlay ---
+    if (isStunned()) {
+        const remaining = (stunnedUntil - performance.now()) / 1000;
+        ctx.fillStyle = 'rgba(200, 0, 0, 0.25)';
+        ctx.fillRect(0, 0, viewWidth, viewHeight);
+        ctx.fillStyle = '#b71c1c';
+        ctx.font = 'bold 32px sans-serif';
+        ctx.fillText(`STUNNED ${remaining.toFixed(1)}s`, viewWidth / 2, viewHeight / 2);
+    }
 
     // --- Game Loop ---
     requestAnimationFrame(drawGame);
@@ -299,6 +388,7 @@ function screenToMapCoords(screenX, screenY) {
 function handleCanvasClick(event) {
     event.preventDefault();
     if (isPanning) return; // Don't click if panning finished on same spot
+    if (isStunned()) return; // Server would reject it anyway
 
     // Simple click for reveal
     const rect = canvas.getBoundingClientRect();
@@ -312,6 +402,7 @@ function handleCanvasClick(event) {
 
 function handleContextMenu(event) {
     event.preventDefault(); // Prevent browser context menu
+    if (isStunned()) return;
     const rect = canvas.getBoundingClientRect();
     const screenX = event.clientX - rect.left;
     const screenY = event.clientY - rect.top;
@@ -373,13 +464,10 @@ function handlePointerMove(event) {
          // Update start points for next move calculation
          panStartX = point.x;
          panStartY = point.y;
-     }
 
-      // Send player position update (throttling needed!)
-      // For now, send on every move while dragging (will be too much)
-      // TODO: Implement throttling for updatePosition
-      // const mapCoords = screenToMapCoords(point.clientX - canvas.getBoundingClientRect().left, point.clientY - canvas.getBoundingClientRect().top);
-      // sendMessage({ type: 'updatePosition', data: mapCoords });
+         // Sync position and load the newly visible area (throttled)
+         syncViewport();
+     }
 
 }
 

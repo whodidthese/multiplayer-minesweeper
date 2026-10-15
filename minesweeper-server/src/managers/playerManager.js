@@ -32,7 +32,8 @@ async function addPlayer(ws) {
             id: playerId,
             x: Math.floor(MAP_WIDTH / 2), // Default starting position (center)
             y: Math.floor(MAP_HEIGHT / 2),
-            score: dbPlayer.score // Initialize score from DB
+            score: dbPlayer.score, // Initialize score from DB
+            stunnedUntil: 0 // Epoch ms until which the player cannot act
         };
 
         activePlayers.set(playerId, player);
@@ -80,9 +81,9 @@ function removePlayer(ws) {
 function updatePlayerPosition(playerId, x, y) {
     const player = activePlayers.get(playerId);
     if (player) {
-        // Basic validation/clamping (optional, depends if client sends invalid coords)
-        player.x = Math.max(0, Math.min(MAP_WIDTH - 1, x));
-        player.y = Math.max(0, Math.min(MAP_HEIGHT - 1, y));
+        // The map is toroidal: wrap coordinates instead of clamping them
+        player.x = ((Math.floor(x) % MAP_WIDTH) + MAP_WIDTH) % MAP_WIDTH;
+        player.y = ((Math.floor(y) % MAP_HEIGHT) + MAP_HEIGHT) % MAP_HEIGHT;
         // logger.debug(`Player ${playerId} position updated to (${player.x}, ${player.y})`);
     } else {
          logger.warn(`Attempted to update position for unknown player ID: ${playerId}`);
@@ -103,6 +104,28 @@ function updatePlayerScore(playerId, newScore) {
     }
 }
 
+
+/**
+ * Stuns a player for the given duration.
+ * @param {string} playerId - The ID of the player.
+ * @param {number} durationMs - Stun duration in milliseconds.
+ */
+function stunPlayer(playerId, durationMs) {
+    const player = activePlayers.get(playerId);
+    if (player) {
+        player.stunnedUntil = Date.now() + durationMs;
+    }
+}
+
+/**
+ * Returns the remaining stun time for a player (0 if not stunned).
+ * @param {string} playerId - The ID of the player.
+ * @returns {number} - Remaining stun time in milliseconds.
+ */
+function getStunRemainingMs(playerId) {
+    const player = activePlayers.get(playerId);
+    return player ? Math.max(0, player.stunnedUntil - Date.now()) : 0;
+}
 
 /**
  * Retrieves the data object for a single active player by ID.
@@ -191,6 +214,8 @@ module.exports = {
     removePlayer,
     updatePlayerPosition,
     updatePlayerScore,
+    stunPlayer,
+    getStunRemainingMs,
     getPlayerById,
     getPlayerIdByWs,
     getPlayersInRegion,

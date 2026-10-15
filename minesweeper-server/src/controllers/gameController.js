@@ -40,10 +40,58 @@ function broadcastToRegion(centerX, centerY, radiusX, radiusY, message, excludeP
     });
 }
 
+/**
+ * Sends a message directly to a single player, if their socket is open.
+ * @param {string} playerId - The recipient's player ID.
+ * @param {object} message - The message object to send (will be stringified).
+ */
+function sendToPlayer(playerId, message) {
+    const playerSession = playerManager.getPlayerById(playerId);
+    if (playerSession && playerSession.ws && playerSession.ws.readyState === WebSocket.OPEN) {
+        playerSession.ws.send(JSON.stringify(message));
+    }
+}
+
+/**
+ * Broadcasts to the region around (x, y) and always delivers to the acting player,
+ * whose server-side position may lag behind where they clicked.
+ */
+function broadcastToRegionAndActor(x, y, message, actorId) {
+    broadcastToRegion(x, y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y, message, actorId);
+    sendToPlayer(actorId, message);
+}
+
+const wrapX = (x) => ((Math.floor(x) % MAP_WIDTH) + MAP_WIDTH) % MAP_WIDTH;
+const wrapY = (y) => ((Math.floor(y) % MAP_HEIGHT) + MAP_HEIGHT) % MAP_HEIGHT;
+
+/**
+ * Fetches the stored cell states for the region centered on (x, y), in client format.
+ * @returns {Promise<{bounds: object, cells: Array<object>}>}
+ */
+async function getRegionCells(x, y, radiusX, radiusY) {
+    const bounds = {
+        xMin: wrapX(x - radiusX),
+        xMax: wrapX(x + radiusX),
+        yMin: wrapY(y - radiusY),
+        yMax: wrapY(y + radiusY),
+    };
+    const cellsData = await dbRepository.getCellStatesInRegion(bounds.xMin, bounds.yMin, bounds.xMax, bounds.yMax);
+    const cells = cellsData.map(cell => ({
+        x: cell.x,
+        y: cell.y,
+        // Determine state based on DB values
+        state: cell.revealed ? (cell.is_mine ? 'mine' : 'revealed') : (cell.flag_state ? 'flagged' : 'hidden'),
+        value: cell.revealed && !cell.is_mine ? cell.adjacent_mines : (cell.revealed && cell.is_mine ? -1 : null)
+    }));
+    return { bounds, cells };
+}
+
 // Define viewport dimensions (adjust as needed)
 // This determines the initial load area and broadcast range
-const VIEWPORT_RADIUS_X = 30;
-const VIEWPORT_RADIUS_Y = 20;
+const VIEWPORT_RADIUS_X = 40;
+const VIEWPORT_RADIUS_Y = 30;
+// Upper bound on the half-size of a region a client may request
+const MAX_REGION_RADIUS = 60;
 
 // --- Connection Handling ---
 
@@ -58,24 +106,11 @@ async function handleConnect(ws) {
     if (newPlayerData) {
         const { id: playerId, x, y, score } = newPlayerData;
 
-        // Define initial viewport region
-        let xMin = (x - VIEWPORT_RADIUS_X + MAP_WIDTH) % MAP_WIDTH;
-        let xMax = (x + VIEWPORT_RADIUS_X) % MAP_WIDTH;
-        let yMin = (y - VIEWPORT_RADIUS_Y + MAP_HEIGHT) % MAP_HEIGHT;
-        let yMax = (y + VIEWPORT_RADIUS_Y) % MAP_HEIGHT;
-
-        // Fetch initial map state for the region
-        const cellsData = await dbRepository.getCellStatesInRegion(xMin, yMin, xMax, yMax);
-        const mapChunk = cellsData.map(cell => ({
-            x: cell.x,
-            y: cell.y,
-            // Determine state based on DB values
-            state: cell.revealed ? (cell.is_mine ? 'mine' : 'revealed') : (cell.flag_state ? 'flagged' : 'hidden'),
-            value: cell.revealed && !cell.is_mine ? cell.adjacent_mines : (cell.revealed && cell.is_mine ? -1 : null)
-        }));
+        // Fetch initial map state for the viewport region
+        const { bounds, cells: mapChunk } = await getRegionCells(x, y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y);
 
         // Fetch nearby players (excluding self)
-        const nearbyPlayers = playerManager.getPlayersInRegion(xMin, yMin, xMax, yMax, playerId);
+        const nearbyPlayers = playerManager.getPlayersInRegion(bounds.xMin, bounds.yMin, bounds.xMax, bounds.yMax, playerId);
 
         // Send initial state to the new player
         const initialStateMessage = {
@@ -133,6 +168,17 @@ function handleDisconnect(ws) {
 // --- Message Handling ---
 
 /**
+ * Rejects an action if the player is still stunned, telling the client how long remains.
+ * @returns {boolean} - True if the action was rejected.
+ */
+function rejectIfStunned(ws, playerId) {
+    const remainingMs = playerManager.getStunRemainingMs(playerId);
+    if (remainingMs <= 0) return false;
+    ws.send(JSON.stringify({ type: 'actionRejected', data: { reason: 'stunned', remainingMs } }));
+    return true;
+}
+
+/**
  * Handles incoming messages from a WebSocket client.
  * @param {WebSocket} ws - The client's WebSocket connection.
  * @param {object} message - The parsed message object.
@@ -165,34 +211,38 @@ async function handleMessage(ws, message) {
                     logger.warn(`Invalid coordinates received in clickCell from ${playerId}: (${x}, ${y})`);
                     return;
                 }
+                if (rejectIfStunned(ws, playerId)) return;
 
                 const result = await gameStateManager.revealCell(playerId, x, y);
 
                 if (result.status === 'ignored') return;
 
                 if (result.status === 'mine_hit') {
-                    // Update score in memory
+                    // Update score in memory and start the stun
                     playerManager.updatePlayerScore(playerId, player.score + result.scoreDelta);
+                    const newScore = player.score; // updatePlayerScore mutates player
+                    playerManager.stunPlayer(playerId, result.stunDurationMs);
                     // Send penalty message to player
                     ws.send(JSON.stringify({
                         type: 'playerPenalty',
-                        data: { score: player.score + result.scoreDelta, stunDurationMs: result.stunDurationMs }
+                        data: { score: newScore, stunDurationMs: result.stunDurationMs }
                     }));
                     // Broadcast map update for the revealed mine
                     const mapUpdateMessage = { type: 'mapUpdate', data: { cells: result.revealedCells } };
-                    broadcastToRegion(x, y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y, mapUpdateMessage, null);
+                    broadcastToRegionAndActor(x, y, mapUpdateMessage, playerId);
                 } else if (result.status === 'revealed') {
                      // Update score in memory
                     playerManager.updatePlayerScore(playerId, player.score + result.scoreDelta);
+                    const newScore = player.score; // updatePlayerScore mutates player
                      // Send score update to player
                      ws.send(JSON.stringify({
                         type: 'scoreUpdate',
-                        data: { score: player.score + result.scoreDelta }
+                        data: { score: newScore }
                     }));
                     // Broadcast map update for all revealed cells
                      const mapUpdateMessage = { type: 'mapUpdate', data: { cells: result.revealedCells } };
                      // Broadcast centered around the initial click
-                    broadcastToRegion(x, y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y, mapUpdateMessage, null);
+                    broadcastToRegionAndActor(x, y, mapUpdateMessage, playerId);
                 }
                 break;
             }
@@ -203,13 +253,14 @@ async function handleMessage(ws, message) {
                     logger.warn(`Invalid coordinates received in flagCell from ${playerId}: (${x}, ${y})`);
                     return;
                 }
+                if (rejectIfStunned(ws, playerId)) return;
 
                 const result = await gameStateManager.toggleFlag(playerId, x, y);
 
                 if (result.status === 'flagged' || result.status === 'unflagged') {
                     // Broadcast the single cell state change
                     const mapUpdateMessage = { type: 'mapUpdate', data: { cells: [result.cellState] } };
-                    broadcastToRegion(x, y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y, mapUpdateMessage, null);
+                    broadcastToRegionAndActor(x, y, mapUpdateMessage, playerId);
                 }
                 break;
             }
@@ -221,7 +272,7 @@ async function handleMessage(ws, message) {
                     return;
                 }
 
-                // Update position in PlayerManager (clamps/validates internally if needed)
+                // Update position in PlayerManager (wraps coordinates onto the map)
                 playerManager.updatePlayerPosition(playerId, x, y);
 
                 // Broadcast new position to nearby players (throttling might be desired here)
@@ -230,6 +281,23 @@ async function handleMessage(ws, message) {
                     data: { players: [{ id: playerId, x: player.x, y: player.y }] } // Send updated pos
                 };
                 broadcastToRegion(player.x, player.y, VIEWPORT_RADIUS_X, VIEWPORT_RADIUS_Y, positionUpdateMessage, playerId); // Exclude self
+                break;
+            }
+
+            case 'requestRegion': {
+                const { x, y, radiusX, radiusY } = message.data || {};
+                if (![x, y, radiusX, radiusY].every(Number.isFinite)) {
+                    logger.warn(`Invalid requestRegion from ${playerId}: ${JSON.stringify(message.data)}`);
+                    return;
+                }
+                const rx = Math.max(1, Math.min(MAX_REGION_RADIUS, Math.ceil(radiusX)));
+                const ry = Math.max(1, Math.min(MAX_REGION_RADIUS, Math.ceil(radiusY)));
+                const { bounds, cells } = await getRegionCells(x, y, rx, ry);
+                const regionPlayers = playerManager.getPlayersInRegion(bounds.xMin, bounds.yMin, bounds.xMax, bounds.yMax, playerId);
+                ws.send(JSON.stringify({
+                    type: 'regionState',
+                    data: { ...bounds, cells, players: regionPlayers }
+                }));
                 break;
             }
 
